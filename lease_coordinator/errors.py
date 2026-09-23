@@ -1,0 +1,45 @@
+"""Distinguishable failure reasons for lease operations."""
+
+from __future__ import annotations
+
+
+class LeaseError(Exception):
+    """Base class for all lease related failures."""
+
+    code: str = "lease_error"
+
+
+class LeaseNotFoundError(LeaseError):
+    """The referenced lease id does not exist."""
+
+    code = "lease_not_found"
+
+
+class LeaseConflictError(LeaseError):
+    """The resource is currently held by another valid lease."""
+
+    code = "lease_conflict"
+
+
+class InvalidCredentialError(LeaseError):
+    """Holder credential does not match the lease record."""
+
+    code = "invalid_credential"
+
+
+class LeaseExpiredError(LeaseError):
+    """The lease has passed its expiry time and is no longer valid."""
+
+    code = "lease_expired"
+
+
+class LeaseReleasedError(LeaseError):
+    """The lease has already been released."""
+
+    code = "lease_released"
+
+
+class InvalidCursorError(LeaseError):
+    """The pagination cursor is malformed or points to a deleted position."""
+
+    code = "invalid_cursor"
