@@ -9,3 +9,16 @@ dependencies = [
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"
 default = true
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+log_cli = false
+log_format = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+log_level = "INFO"
+testpaths = ["tests"]
