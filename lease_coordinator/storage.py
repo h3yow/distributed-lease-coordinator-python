@@ -24,7 +24,7 @@ import uuid
 from pathlib import Path
 from typing import Callable, TypeVar
 
-from .model import EventPage, Lease, LeaseEvent, LeasePage, LeaseStatus
+from .model import EventPage, Lease, LeaseEvent, LeasePage, LeaseStatus, RotationRecord
 
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -63,6 +63,19 @@ CREATE TABLE IF NOT EXISTS lease_events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_lease ON lease_events(lease_id, id);
 CREATE INDEX IF NOT EXISTS idx_events_resource ON lease_events(resource_id, id);
+
+CREATE TABLE IF NOT EXISTS credential_rotations (
+    rotation_id               TEXT PRIMARY KEY,
+    lease_id                  TEXT NOT NULL,
+    resource_id               TEXT NOT NULL,
+    new_credential            TEXT NOT NULL,
+    presenter_credential_sha256 TEXT NOT NULL,
+    fencing_token             INTEGER NOT NULL,
+    rotated_at_ms             INTEGER NOT NULL,
+    lease_version             INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rotations_lease
+    ON credential_rotations(lease_id, rotated_at_ms);
 """
 
 T = TypeVar("T")
@@ -199,6 +212,19 @@ class LeaseStorage:
             to_status=row["to_status"],
             occurred_at_ms=row["occurred_at_ms"],
             detail=row["detail"],
+        )
+
+    @staticmethod
+    def _row_to_rotation(row: sqlite3.Row) -> RotationRecord:
+        return RotationRecord(
+            rotation_id=row["rotation_id"],
+            lease_id=row["lease_id"],
+            resource_id=row["resource_id"],
+            new_credential=row["new_credential"],
+            presenter_credential_sha256=row["presenter_credential_sha256"],
+            fencing_token=row["fencing_token"],
+            rotated_at_ms=row["rotated_at_ms"],
+            lease_version=row["lease_version"],
         )
 
     # -- events -------------------------------------------------------------
@@ -466,8 +492,143 @@ class LeaseStorage:
 
         return self._with_transaction(txn)
 
-    # -- reads --------------------------------------------------------------
+    def atomic_rotate_credential(
+        self,
+        lease_id: str,
+        rotation_id: str,
+        presented_credential: str,
+        presented_sha256: str,
+        new_credential: str,
+        caller_supplied_new: bool,
+        now_ms: int,
+    ) -> tuple[RotationRecord | None, Lease | None, str | None, bool]:
+        """Rotate a lease credential inside one database transaction.
 
+        Returns ``(record, lease, reason, replayed)``.
+
+        * ``rotation_id`` is a client-supplied idempotency key. The first
+          call performs the swap; an identical retry is served from the
+          stored record with ``replayed=True``; a reused id carrying
+          different parameters returns ``reason='id_reused'`` and changes
+          nothing.
+        * Fresh applications use the same decision order as renew/release:
+          existence -> credential -> released -> expired (lazily marked)
+          -> conditional swap, so the outcome is always unambiguous and
+          interlocked with concurrent expiry.
+        """
+
+        def txn(
+            conn: sqlite3.Connection,
+        ) -> tuple[RotationRecord | None, Lease | None, str | None, bool]:
+            row = conn.execute(
+                "SELECT * FROM credential_rotations WHERE rotation_id = ?",
+                (rotation_id,),
+            ).fetchone()
+            if row is not None:
+                record = self._row_to_rotation(row)
+                current = self._row_to_lease(
+                    conn.execute(
+                        "SELECT * FROM leases WHERE lease_id = ?", (lease_id,)
+                    ).fetchone()
+                )
+                mismatch = (
+                    record.lease_id != lease_id
+                    or record.presenter_credential_sha256 != presented_sha256
+                    or (
+                        caller_supplied_new
+                        and record.new_credential != new_credential
+                    )
+                )
+                if mismatch:
+                    return record, current, "id_reused", True
+                return record, current, None, True
+
+            row = conn.execute(
+                "SELECT * FROM leases WHERE lease_id = ?", (lease_id,)
+            ).fetchone()
+            current = self._row_to_lease(row)
+            if current is None:
+                return None, None, "not_found", False
+            if current.credential != presented_credential:
+                return None, current, "bad_credential", False
+            if current.status is LeaseStatus.RELEASED:
+                return None, current, "released", False
+            if current.status is LeaseStatus.EXPIRED or current.expires_at_ms <= now_ms:
+                if current.status is LeaseStatus.HELD:
+                    conn.execute(
+                        "UPDATE leases SET status = ?, expire_reason = ?, version = version + 1 "
+                        "WHERE lease_id = ? AND status = ?",
+                        (LeaseStatus.EXPIRED.value, "ttl_elapsed_before_rotate",
+                         lease_id, LeaseStatus.HELD.value),
+                    )
+                    self._insert_event(
+                        conn, lease_id, current.resource_id, "EXPIRED", now_ms,
+                        LeaseStatus.HELD.value, LeaseStatus.EXPIRED.value,
+                        "rotation rejected: ttl already elapsed",
+                    )
+                    current = self._row_to_lease(
+                        conn.execute(
+                            "SELECT * FROM leases WHERE lease_id = ?", (lease_id,)
+                        ).fetchone()
+                    )
+                return None, current, "expired", False
+            if new_credential == presented_credential:
+                # A rotation must actually replace the secret.
+                return None, current, "identical_credential", False
+
+            cur = conn.execute(
+                "UPDATE leases SET credential = ?, version = version + 1 "
+                "WHERE lease_id = ? AND status = ? AND credential = ? AND expires_at_ms > ?",
+                (new_credential, lease_id, LeaseStatus.HELD.value,
+                 presented_credential, now_ms),
+            )
+            if cur.rowcount != 1:
+                # Lost a concurrent transition: re-read for an accurate reason.
+                fresh = self._row_to_lease(
+                    conn.execute(
+                        "SELECT * FROM leases WHERE lease_id = ?", (lease_id,)
+                    ).fetchone()
+                )
+                if fresh is None:
+                    return None, None, "not_found", False
+                if fresh.status is LeaseStatus.RELEASED:
+                    return None, fresh, "released", False
+                if fresh.status is not LeaseStatus.HELD or fresh.expires_at_ms <= now_ms:
+                    return None, fresh, "expired", False
+                return None, fresh, "bad_credential", False
+            swapped = self._row_to_lease(
+                conn.execute(
+                    "SELECT * FROM leases WHERE lease_id = ?", (lease_id,)
+                ).fetchone()
+            )
+            assert swapped is not None
+            conn.execute(
+                """
+                INSERT INTO credential_rotations
+                    (rotation_id, lease_id, resource_id, new_credential,
+                     presenter_credential_sha256, fencing_token,
+                     rotated_at_ms, lease_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (rotation_id, lease_id, swapped.resource_id, new_credential,
+                 presented_sha256, swapped.fencing_token, now_ms,
+                 swapped.version),
+            )
+            self._insert_event(
+                conn, lease_id, swapped.resource_id, "CREDENTIAL_ROTATED", now_ms,
+                LeaseStatus.HELD.value, LeaseStatus.HELD.value,
+                f"credential rotated rotation_id={rotation_id} "
+                f"fencing_token={swapped.fencing_token} version={swapped.version}",
+            )
+            record_row = conn.execute(
+                "SELECT * FROM credential_rotations WHERE rotation_id = ?",
+                (rotation_id,),
+            ).fetchone()
+            return self._row_to_rotation(record_row), swapped, None, False
+
+        return self._with_transaction(txn)
+
+    # -- reads --------------------------------------------------------------
     def get_lease(self, lease_id: str) -> Lease | None:
         conn = self._get_conn()
         return self._row_to_lease(

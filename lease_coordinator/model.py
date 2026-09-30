@@ -53,6 +53,41 @@ class LeaseEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class RotationRecord:
+    """The persisted record of one successful credential rotation.
+
+    The credential presented by the initiator is kept only as an
+    irreversible SHA-256 digest, so replays can be validated without
+    retaining the old secret itself.
+    """
+
+    rotation_id: str
+    lease_id: str
+    resource_id: str
+    new_credential: str
+    presenter_credential_sha256: str
+    fencing_token: int
+    rotated_at_ms: int
+    lease_version: int
+
+
+@dataclass(frozen=True, slots=True)
+class CredentialRotation:
+    """Result handed back to the party that applied for a rotation.
+
+    ``replayed`` is ``False`` for the first successful application and
+    ``True`` when an identical retry (same ``rotation_id``) was served
+    from the stored record, so the outcome is never ambiguous.
+    """
+
+    rotation_id: str
+    new_credential: str
+    rotated_at_ms: int
+    replayed: bool
+    lease: Lease
+
+
+@dataclass(frozen=True, slots=True)
 class LeasePage:
     """One cursor-paginated page of lease snapshots."""
 

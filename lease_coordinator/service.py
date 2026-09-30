@@ -7,6 +7,7 @@ explain why a request was granted or rejected.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import secrets
 import threading
@@ -15,15 +16,18 @@ from pathlib import Path
 from .errors import (
     InvalidCredentialError,
     InvalidCursorError,
+    InvalidRotationError,
     LeaseConflictError,
     LeaseError,
     LeaseExpiredError,
     LeaseNotFoundError,
     LeaseReleasedError,
+    RotationConflictError,
 )
 from .ids import IdGenerator, UuidLeaseIdGenerator
 from .model import (
     Clock,
+    CredentialRotation,
     EventPage,
     Lease,
     LeasePage,
@@ -199,6 +203,86 @@ class LeaseService:
         assert lease is not None
         logger.info("release granted lease_id=%s", lease_id)
         return lease
+
+    def rotate_credential(
+        self,
+        lease_id: str,
+        credential: str,
+        rotation_id: str,
+        new_credential: str | None = None,
+    ) -> CredentialRotation:
+        """Swap the holder credential of a still-valid lease.
+
+        The caller must supply its current ``credential`` and a unique
+        ``rotation_id`` (idempotency key for retries). The new credential
+        is either provided by the caller or generated server-side; it is
+        delivered exactly once in this result and never via queries.
+        """
+        if not rotation_id:
+            raise ValueError("rotation_id must be a non-empty string")
+        if not credential:
+            raise ValueError("credential must be a non-empty string")
+        if new_credential is not None and not new_credential:
+            raise ValueError("new_credential must be a non-empty string when given")
+        now_ms = self._clock.now_ms()
+        caller_supplied_new = new_credential is not None
+        candidate = new_credential or secrets.token_hex(16)
+        presented_sha256 = hashlib.sha256(credential.encode("utf-8")).hexdigest()
+        logger.info(
+            "rotate request lease_id=%s rotation_id=%s now_ms=%s "
+            "credential_len=%s new_credential_source=%s",
+            lease_id, rotation_id, now_ms, len(credential),
+            "caller" if caller_supplied_new else "server",
+        )
+        record, lease, reason, replayed = self._storage.atomic_rotate_credential(
+            lease_id=lease_id,
+            rotation_id=rotation_id,
+            presented_credential=credential,
+            presented_sha256=presented_sha256,
+            new_credential=candidate,
+            caller_supplied_new=caller_supplied_new,
+            now_ms=now_ms,
+        )
+        if reason == "id_reused":
+            logger.warning(
+                "rotate rejected lease_id=%s rotation_id=%s reason=id_reused "
+                "(same rotation id previously committed with different parameters)",
+                lease_id, rotation_id,
+            )
+            raise RotationConflictError(
+                f"rotation_id {rotation_id} was already committed with different "
+                "parameters; generate a new rotation_id for a new rotation"
+            )
+        if reason == "identical_credential":
+            logger.warning(
+                "rotate rejected lease_id=%s rotation_id=%s reason=identical_credential",
+                lease_id, rotation_id,
+            )
+            raise InvalidRotationError(
+                "new_credential must differ from the current credential"
+            )
+        self._raise_for_reason(reason, lease, "rotate")
+        assert record is not None
+        assert lease is not None
+        if caller_supplied_new and record.new_credential != candidate:
+            # Should be impossible: a caller-supplied credential mismatch is
+            # classified as id_reused inside the transaction.
+            logger.error(
+                "rotate internal inconsistency lease_id=%s rotation_id=%s "
+                "delivering stored credential", lease_id, rotation_id,
+            )
+        logger.info(
+            "rotate %s lease_id=%s rotation_id=%s version=%s status=%s",
+            "replayed" if replayed else "granted",
+            lease_id, rotation_id, lease.version, lease.status.value,
+        )
+        return CredentialRotation(
+            rotation_id=record.rotation_id,
+            new_credential=record.new_credential,
+            rotated_at_ms=record.rotated_at_ms,
+            replayed=replayed,
+            lease=lease,
+        )
 
     def expire_due_leases(self, batch_size: int = 100) -> list[Lease]:
         """Actively expire every due lease; each lease expires at most once."""

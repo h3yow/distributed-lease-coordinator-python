@@ -13,8 +13,10 @@ from .errors import (
     LeaseExpiredError,
     LeaseNotFoundError,
     LeaseReleasedError,
+    RotationConflictError,
+    InvalidRotationError,
 )
-from .model import EventPage, Lease, LeaseEvent, LeasePage
+from .model import CredentialRotation, EventPage, Lease, LeaseEvent, LeasePage
 from .schema import (
     AcquireRequest,
     EventPageView,
@@ -23,6 +25,8 @@ from .schema import (
     LeaseView,
     ReleaseRequest,
     RenewRequest,
+    RotateRequest,
+    RotationResultView,
 )
 from .service import LeaseService
 
@@ -36,6 +40,8 @@ _ERROR_STATUS: dict[type[LeaseError], int] = {
     LeaseExpiredError: 409,
     LeaseReleasedError: 409,
     InvalidCursorError: 400,
+    RotationConflictError: 409,
+    InvalidRotationError: 422,
 }
 
 
@@ -71,6 +77,16 @@ def _lease_page_view(page: LeasePage) -> LeasePageView:
     return LeasePageView(
         items=[_lease_view(i) for i in page.items],
         next_cursor=page.next_cursor,
+    )
+
+
+def _rotation_view(rotation: CredentialRotation) -> RotationResultView:
+    return RotationResultView(
+        rotation_id=rotation.rotation_id,
+        new_credential=rotation.new_credential,
+        rotated_at_ms=rotation.rotated_at_ms,
+        replayed=rotation.replayed,
+        lease=_lease_view(rotation.lease),
     )
 
 
@@ -123,6 +139,18 @@ def create_app(service: LeaseService) -> FastAPI:
     @application.post("/leases/{lease_id}/release", response_model=LeaseView)
     def release_lease(lease_id: str, body: ReleaseRequest) -> LeaseView:
         return _lease_view(service.release(lease_id, body.credential))
+
+    @application.post(
+        "/leases/{lease_id}/rotate", response_model=RotationResultView
+    )
+    def rotate_credential(lease_id: str, body: RotateRequest) -> RotationResultView:
+        rotation = service.rotate_credential(
+            lease_id=lease_id,
+            credential=body.credential,
+            rotation_id=body.rotation_id,
+            new_credential=body.new_credential,
+        )
+        return _rotation_view(rotation)
 
     @application.post("/maintenance/expire-due")
     def expire_due() -> dict[str, int]:

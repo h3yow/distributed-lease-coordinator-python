@@ -43,3 +43,21 @@ class InvalidCursorError(LeaseError):
     """The pagination cursor is malformed or points to a deleted position."""
 
     code = "invalid_cursor"
+
+
+class RotationConflictError(LeaseError):
+    """A rotation id is already committed with different request parameters.
+
+    This covers the *ambiguous retry* case: the same client supplied
+    ``rotation_id`` before but with a different lease / presented
+    credential, so the server cannot tell whether the caller retried
+    wrongly or reused an id by mistake. Nothing is mutated.
+    """
+
+    code = "rotation_conflict"
+
+
+class InvalidRotationError(LeaseError):
+    """The rotation request itself is malformed (e.g. identical credentials)."""
+
+    code = "invalid_rotation"

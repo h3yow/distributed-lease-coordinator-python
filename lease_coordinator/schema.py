@@ -23,6 +23,12 @@ class ReleaseRequest(BaseModel):
     credential: str = Field(min_length=1)
 
 
+class RotateRequest(BaseModel):
+    credential: str = Field(min_length=1)
+    rotation_id: str = Field(min_length=1, max_length=128)
+    new_credential: str | None = Field(default=None, min_length=1)
+
+
 class LeaseView(BaseModel):
     lease_id: str
     resource_id: str
@@ -39,6 +45,14 @@ class LeaseView(BaseModel):
 class LeasePageView(BaseModel):
     items: list[LeaseView]
     next_cursor: str | None
+
+
+class RotationResultView(BaseModel):
+    rotation_id: str
+    new_credential: str
+    rotated_at_ms: int
+    replayed: bool
+    lease: LeaseView
 
 
 class EventView(BaseModel):
