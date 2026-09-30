@@ -13,6 +13,7 @@ from .errors import (
     LeaseExpiredError,
     LeaseNotFoundError,
     LeaseReleasedError,
+    RotationConflictError,
 )
 from .model import EventPage, Lease, LeaseEvent, LeasePage
 from .schema import (
@@ -23,6 +24,8 @@ from .schema import (
     LeaseView,
     ReleaseRequest,
     RenewRequest,
+    RotateRequest,
+    RotationView,
 )
 from .service import LeaseService
 
@@ -36,6 +39,7 @@ _ERROR_STATUS: dict[type[LeaseError], int] = {
     LeaseExpiredError: 409,
     LeaseReleasedError: 409,
     InvalidCursorError: 400,
+    RotationConflictError: 409,
 }
 
 
@@ -51,6 +55,19 @@ def _lease_view(lease: Lease) -> LeaseView:
         released_at_ms=lease.released_at_ms,
         expire_reason=lease.expire_reason,
         version=lease.version,
+        credential_version=lease.credential_version,
+    )
+
+
+def _rotation_view(rotation) -> RotationView:
+    return RotationView(
+        lease_id=rotation.lease_id,
+        resource_id=rotation.resource_id,
+        request_id=rotation.request_id,
+        status=rotation.status.value,
+        credential=rotation.credential,
+        credential_version=rotation.credential_version,
+        rotated_at_ms=rotation.rotated_at_ms,
     )
 
 
@@ -98,6 +115,17 @@ def create_app(service: LeaseService) -> FastAPI:
             },
         )
 
+    @application.exception_handler(ValueError)
+    async def handle_value_error(_request: Request, exc: ValueError) -> JSONResponse:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "ValueError",
+                "code": "invalid_request",
+                "detail": str(exc),
+            },
+        )
+
     @application.post("/leases", response_model=LeaseView, status_code=201)
     def acquire_lease(body: AcquireRequest) -> LeaseView:
         lease = service.acquire(
@@ -123,6 +151,16 @@ def create_app(service: LeaseService) -> FastAPI:
     @application.post("/leases/{lease_id}/release", response_model=LeaseView)
     def release_lease(lease_id: str, body: ReleaseRequest) -> LeaseView:
         return _lease_view(service.release(lease_id, body.credential))
+
+    @application.post("/leases/{lease_id}/rotate", response_model=RotationView)
+    def rotate_credential(lease_id: str, body: RotateRequest) -> RotationView:
+        rotation = service.rotate_credential(
+            lease_id=lease_id,
+            credential=body.credential,
+            new_credential=body.new_credential,
+            request_id=body.request_id,
+        )
+        return _rotation_view(rotation)
 
     @application.post("/maintenance/expire-due")
     def expire_due() -> dict[str, int]:

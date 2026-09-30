@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import secrets
 import threading
+import uuid
 from pathlib import Path
 
 from .errors import (
@@ -20,13 +21,16 @@ from .errors import (
     LeaseExpiredError,
     LeaseNotFoundError,
     LeaseReleasedError,
+    RotationConflictError,
 )
 from .ids import IdGenerator, UuidLeaseIdGenerator
 from .model import (
     Clock,
+    CredentialRotation,
     EventPage,
     Lease,
     LeasePage,
+    RotationStatus,
     SystemClock,
 )
 from .storage import LeaseStorage
@@ -199,6 +203,96 @@ class LeaseService:
         assert lease is not None
         logger.info("release granted lease_id=%s", lease_id)
         return lease
+
+    def rotate_credential(
+        self,
+        lease_id: str,
+        credential: str,
+        new_credential: str | None = None,
+        request_id: str | None = None,
+    ) -> CredentialRotation:
+        """Rotate the holder credential of a not-yet-expired lease.
+
+        On success the old credential is invalid immediately and the new
+        credential is returned *only* in this result. The lease keeps the
+        same lease id, fencing token and expiry time; only the credential
+        (and its version) changes.
+
+        ``request_id`` is the idempotency key. Retries and concurrent
+        duplicates carrying the same key and parameters converge to one
+        rotation: the first call is ``ROTATED``, later ones are ``REPLAYED``
+        and hand back the same credential. Reusing a key for a different
+        request raises :class:`RotationConflictError`. When omitted, the
+        server assigns a fresh key, so such a call cannot be retried
+        transparently.
+        """
+        if not credential:
+            raise ValueError("credential must be a non-empty string")
+        if new_credential is not None and not new_credential:
+            raise ValueError("new_credential must be a non-empty string when given")
+        request_id = request_id or f"srv-{uuid.uuid4().hex}"
+        now_ms = self._clock.now_ms()
+        logger.info(
+            "rotate request lease_id=%s request_id=%s now_ms=%s "
+            "credential_len=%s new_credential_source=%s",
+            lease_id, request_id, now_ms, len(credential),
+            "caller" if new_credential is not None else "server",
+        )
+        outcome, lease, reason = self._storage.atomic_rotate_credential(
+            lease_id, credential, new_credential, request_id, now_ms
+        )
+        if reason is not None:
+            self._raise_for_rotation_reason(reason, lease, lease_id, request_id)
+        assert outcome is not None and lease is not None
+        status = RotationStatus(str(outcome["status"]).upper())
+        result = CredentialRotation(
+            lease_id=lease_id,
+            resource_id=lease.resource_id,
+            request_id=str(outcome["request_id"]),
+            status=status,
+            credential=str(outcome["credential"]),
+            credential_version=int(outcome["credential_version"]),
+            rotated_at_ms=now_ms,
+            lease=lease,
+        )
+        logger.info(
+            "rotate %s lease_id=%s request_id=%s credential_version=%s "
+            "lease_expires_at_ms=%s lease_status=%s",
+            status.value.lower(), lease_id, result.request_id,
+            result.credential_version, lease.expires_at_ms,
+            lease.status.value,
+        )
+        return result
+
+    def _raise_for_rotation_reason(
+        self,
+        reason: str,
+        lease: Lease | None,
+        lease_id: str,
+        request_id: str,
+    ) -> None:
+        if reason == "not_found":
+            logger.warning(
+                "rotate rejected lease_id=%s request_id=%s: lease does not exist",
+                lease_id, request_id,
+            )
+            raise LeaseNotFoundError("lease does not exist")
+        if reason == "request_conflict":
+            logger.warning(
+                "rotate rejected lease_id=%s request_id=%s: request id was "
+                "already used with different parameters",
+                lease_id, request_id,
+            )
+            raise RotationConflictError(
+                f"request id {request_id} was already used for a different "
+                f"rotation request"
+            )
+        if reason == "same_credential":
+            raise ValueError(
+                "new credential must differ from the current credential"
+            )
+        # Other reasons share the lease-scoped decision vocabulary.
+        self._raise_for_reason(reason, lease, "rotate")
 
     def expire_due_leases(self, batch_size: int = 100) -> list[Lease]:
         """Actively expire every due lease; each lease expires at most once."""

@@ -23,6 +23,12 @@ class ReleaseRequest(BaseModel):
     credential: str = Field(min_length=1)
 
 
+class RotateRequest(BaseModel):
+    credential: str = Field(min_length=1)
+    new_credential: str | None = Field(default=None, min_length=1)
+    request_id: str | None = Field(default=None, min_length=1)
+
+
 class LeaseView(BaseModel):
     lease_id: str
     resource_id: str
@@ -34,6 +40,22 @@ class LeaseView(BaseModel):
     released_at_ms: int | None = None
     expire_reason: str | None = None
     version: int
+    credential_version: int = 0
+
+
+class RotationView(BaseModel):
+    """Result of a credential rotation.
+
+    The new credential is delivered only here (and on idempotent replays).
+    """
+
+    lease_id: str
+    resource_id: str
+    request_id: str
+    status: str  # ROTATED | REPLAYED
+    credential: str
+    credential_version: int
+    rotated_at_ms: int
 
 
 class LeasePageView(BaseModel):

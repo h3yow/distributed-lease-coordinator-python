@@ -43,3 +43,15 @@ class InvalidCursorError(LeaseError):
     """The pagination cursor is malformed or points to a deleted position."""
 
     code = "invalid_cursor"
+
+
+class RotationConflictError(LeaseError):
+    """A rotation request id was reused with different parameters.
+
+    The same idempotency key must always carry the same target lease and
+    the same caller-supplied credential. Replaying the original request
+    (identical parameters) is safe; reusing the key for a *different*
+    request is rejected explicitly rather than silently applied.
+    """
+
+    code = "rotation_conflict"

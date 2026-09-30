@@ -36,6 +36,38 @@ class Lease:
     released_at_ms: int | None = None
     expire_reason: str | None = None
     version: int = 0
+    credential_version: int = 0
+
+
+class RotationStatus(str, Enum):
+    """Outcome of one credential rotation request.
+
+    ROTATED  : this call actually performed the credential swap.
+    REPLAYED : the same request id had already completed; the previously
+               generated credential is returned deterministically.
+    """
+
+    ROTATED = "ROTATED"
+    REPLAYED = "REPLAYED"
+
+
+@dataclass(frozen=True, slots=True)
+class CredentialRotation:
+    """Explicit result of a credential rotation request.
+
+    The new credential is delivered *only* through this result (and its
+    idempotent replays); ordinary lease snapshots and history events never
+    carry credential material.
+    """
+
+    lease_id: str
+    resource_id: str
+    request_id: str
+    status: RotationStatus
+    credential: str
+    credential_version: int
+    rotated_at_ms: int
+    lease: Lease
 
 
 @dataclass(frozen=True, slots=True)
