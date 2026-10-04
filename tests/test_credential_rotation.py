@@ -21,6 +21,7 @@ from lease_coordinator.errors import (
     LeaseNotFoundError,
     LeaseReleasedError,
     RotationConflictError,
+    RotationRequestIdRequiredError,
 )
 from lease_coordinator.model import FakeClock, RotationStatus, LeaseStatus
 from lease_coordinator.service import LeaseService
@@ -145,12 +146,23 @@ def test_rotation_with_wrong_credential_is_rejected(service: LeaseService) -> No
     assert snap.credential == lease.credential
 
 
-def test_server_assigns_request_id_when_caller_omits_it(
+def test_rotation_without_request_id_is_rejected_before_any_state_change(
     service: LeaseService,
 ) -> None:
     lease = service.acquire("doc-1", "writer-A", ttl_ms=10_000)
-    rotation = service.rotate_credential(lease.lease_id, lease.credential)
-    assert rotation.request_id.startswith("srv-")
+    with pytest.raises(RotationRequestIdRequiredError) as exc:
+        service.rotate_credential(lease.lease_id, lease.credential)
+    assert exc.value.code == "rotation_request_id_required"
+    # Absolutely nothing changed: the old credential is still usable, no
+    # rotation record/event exists, the version counters are untouched.
+    snap = service.get_lease(lease.lease_id)
+    assert snap.credential == lease.credential
+    assert snap.credential_version == 0
+    assert snap.version == 0
+    events = service.list_events_for_lease(lease.lease_id).items
+    assert [e.event_type for e in events] == ["ACQUIRED"]
+    renewed = service.renew(lease.lease_id, lease.credential, ttl_ms=10_000)
+    assert renewed.status is LeaseStatus.HELD
 
 
 # --------------------------------------------------------------------------

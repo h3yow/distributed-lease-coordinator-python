@@ -30,7 +30,7 @@ uv run pytest -s                              # 运行全部测试并打印判�
 | GET | `/leases/{lease_id}` | 查询单个租约当前快照（不含凭证本体） |
 | POST | `/leases/{lease_id}/renew` | 续约，body: `credential, ttl_ms` |
 | POST | `/leases/{lease_id}/release` | 释放，body: `credential` |
-| POST | `/leases/{lease_id}/rotate` | 凭证换发，body: `credential, new_credential?, request_id?` |
+| POST | `/leases/{lease_id}/rotate` | 凭证换发，body: `credential, new_credential?, request_id`（请求号必填） |
 | POST | `/maintenance/expire-due` | 主动回收所有到期租约 |
 | GET | `/leases/{lease_id}/events?limit=&cursor=` | 单个租约的状态迁移历史 |
 | GET | `/resources/{resource_id}/events?limit=&cursor=` | 某资源的完整迁移链 |
@@ -96,11 +96,13 @@ curl -s -X POST localhost:8000/leases \
 | `lease_not_found` | `LeaseNotFoundError` | 404 | 租约 id 不存在 |
 | `invalid_cursor` | `InvalidCursorError` | 400 | 分页游标损坏 |
 | `rotation_conflict` | `RotationConflictError` | 409 | 换发请求号已被用于另一组参数 |
+| `rotation_request_id_required` | `RotationRequestIdRequiredError` | 400 | 换发未携带调用方请求号（在任何状态检查/改动之前拒绝） |
 | `invalid_request` | `ValueError` | 400 | 请求参数非法（如新旧凭证相同） |
 
 判定顺序（在同一数据库事务内）：存在性 → 凭证 → 已释放 → 已到期 → 执行。
 因此“凭证错误”和“已到期”即使同时成立也只会得到一个确定的、可复现的原因。
-换发在进入上述判定前，还会先按请求号做幂等去重（见 6.3 节）。
+换发在进入事务前先做请求号必填校验（缺失即 400，不触碰任何状态），
+进入上述判定前再按请求号做幂等去重（见 6.3 节）。
 
 ## 4. 过期与回收规则
 
@@ -151,28 +153,40 @@ curl -s -X POST localhost:8000/leases \
 ### 6.2 凭证交付规则（只此一处）
 
 新凭证**只在换发结果中返回**（`CredentialRotation.credential` / HTTP
-响应的 `credential` 字段）。普通租约快照、`GET /leases` 列表、
-`GET /leases/{id}/events` 与资源历史都不会带出任何凭证本体；历史里只追加
-一条 `CREDENTIAL_ROTATED` 事件，detail 仅记录凭证版本变化、凭证来源
-（`server`/`caller`）和请求号，不包含旧凭证或新凭证。
+响应的 `credential` 字段，含其幂等重放的响应）。普通租约快照、
+`GET /leases` 列表、`GET /leases/{id}/events` 与资源历史都不会带出任何
+凭证本体；历史里只追加一条 `CREDENTIAL_ROTATED` 事件，detail 仅记录
+凭证版本变化、凭证来源（`server`/`caller`）和请求号，不包含旧凭证或新凭证。
+
+落盘同样不留明文：`credential_rotations` 表只保存凭证的 SHA-256 摘要
+（用于识别“同一请求号是否被不同参数复用”）以及请求号、凭证来源、版本号、
+换发时间等事实；服务端生成的新凭证**从不写入数据库**，而是用库内持久化的
+派生密钥对 `(lease_id, request_id)` 做 HMAC 确定性派生——重放时重新算出
+同一个凭证交付，因此磁盘上任何地方都看不到它。已失效的旧凭证在库中
+不留任何痕迹；当前生效的凭证只存在于 `leases` 运行状态行中。
 
 两种凭证来源都支持：
 
 - 调用方自带：请求带 `new_credential`，服务端原样采用（要求非空且与旧凭证不同）。
-- 服务端生成：省略 `new_credential`，服务端生成 `secrets.token_hex(16)`，
-  同样通过换发结果正式交付。
+  重放时必须再次携带同一个 `new_credential`，服务端校验摘要一致后原样交还。
+- 服务端生成：省略 `new_credential`，服务端按上述方式确定性派生，
+  通过换发结果（及其重放）正式交付。
 
 ### 6.3 幂等请求号与明确结果
 
-每次换发都有一个 `request_id`（可由调用方传入；省略时服务端分配一个
-`srv-` 前缀的一次性请求号，这种情况下调用方无法透明重试，重试请自带请求号）。
+每次换发**必须**携带调用方生成的 `request_id` 作为幂等键：
 
-`credential_rotations` 表以 `request_id` 为主键记录每一次**成功**换发：
-
-- 重复提交 / 并发提交 / 超时重试使用**相同请求号与相同参数**时，只有第一次真正换发
-  （结果 `ROTATED`），其余全部返回 `REPLAYED` 并交出同一个新凭证——
-  同一租约的并发换发因此最多一次真正成功。
-- 相同请求号被用于**不同的目标租约或不同的旧凭证**时，返回
+- **缺少请求号的请求会在任何状态检查/改动之前被明确拒绝**
+  （`rotation_request_id_required`，HTTP 400）——不查库、不触发惰性过期、
+  不留任何记录。这样就不存在“服务端临时分配了请求号、响应却在返回路上
+  丢失，旧凭证已失效而新凭证永远取不回”的窗口：没被执行过的请求
+  不可能改变任何状态，调用方带上请求号重新发起即可。
+- 重复提交 / 并发提交 / 超时重试使用**相同请求号与相同参数**时，只有第一次
+  真正换发（结果 `ROTATED`），其余全部返回 `REPLAYED`，并交出与首次
+  **完全相同**的结果：同一个新凭证、同一个凭证版本号、以及**首次真正换发
+  发生的时间** `rotated_at_ms`（不是重试那一刻的时间）。同一租约的并发
+  换发因此最多一次真正成功。
+- 相同请求号被用于**不同的目标租约、不同的旧凭证或不同的新凭证**时，返回
   `rotation_conflict`（HTTP 409），不会有任何状态被改动。
 - 新凭证与旧凭证相同属于调用方参数错误，返回 `invalid_request`（HTTP 400）。
 - 换发在到期判定上与续约/释放完全一致：凭证错误 → `invalid_credential`；
@@ -187,11 +201,17 @@ curl -s -X POST localhost:8000/leases \
 - 换发与续约/释放使用同一套“`status='HELD' AND credential=? AND
   expires_at_ms > now`”条件更新，与后台回收器互斥：回收先到则换发被拒绝，
   租约置为 `EXPIRED`；换发先到则回收按原 TTL 到期后回收新凭证所在租约。
+  两种交错下租约状态、事件流都保持自洽（到期只生效一次，换发不延期）。
 - 已经 `EXPIRED` / `RELEASED` 的租约不会因为换发重新有效，也不会被延长或提前结束。
 - 换发记录与事件落盘，进程重启后用新服务打开同一文件：相同请求号重试仍是
-  `REPLAYED` 并返回同一个新凭证，旧凭证依旧不可用；失败过的换发结论也不变。
-- 旧版本数据库（无 `credential_version` 列）在启动时通过一次
-  `ALTER TABLE` 迁移升级，历史租约的凭证版本从 0 开始。
+  `REPLAYED`，返回同一个新凭证与**首次换发的时间戳**，旧凭证依旧不可用；
+  失败过的换发结论也不变。服务端生成的凭证靠库内持久化的派生密钥重建，
+  重启后重放结果逐字节一致。
+- 旧版本数据库在启动时自动迁移：无 `credential_version` 列的库通过一次
+  `ALTER TABLE` 升级；早期把凭证明文写入 `credential_rotations` 的库会被
+  改写为只含摘要的记录——调用方自带的换发仍可正常重放（重试时重新出示
+  新凭证即可），服务端生成的旧记录无法确定性重建，其重放会被明确拒绝
+  （`rotation_conflict`），需用新请求号重新换发，不会返回错误凭证。
 
 ### 6.5 最小调用示例
 
@@ -200,11 +220,12 @@ curl -s -X POST localhost:8000/leases \
 curl -s -X POST localhost:8000/leases -H 'content-type: application/json' \
   -d '{"resource_id":"orders/42","holder":"worker-1","ttl_ms":30000,"credential":"c-old"}'
 
-# 2) 换发：固定 request_id 以便安全重试；响应里的 credential 是唯一交付渠道
+# 2) 换发：必须固定 request_id 以便安全重试；响应里的 credential 是唯一交付渠道
 curl -s -X POST localhost:8000/leases/<lease_id>/rotate \
   -H 'content-type: application/json' \
   -d '{"credential":"c-old","new_credential":"c-new","request_id":"rot-2026-09-30-001"}'
 # -> {"status":"ROTATED","credential":"c-new","credential_version":1,"request_id":"...", ...}
+#    省略 request_id 会直接得到 400 rotation_request_id_required，且没有任何状态变化
 
 # 3) 之后只用新凭证续约/释放；旧凭证立即 403
 ```
@@ -230,7 +251,8 @@ lease_coordinator/
   errors.py    # 7 种可区分失败原因（含 rotation_conflict）
   ids.py       # uuid 与确定性序列 id 生成器
   storage.py   # SQLite schema、原子事务（acquire/renew/release/expire/rotate）、
-               # credential_rotations 幂等表、旧库迁移、游标编解码
+               # credential_rotations 幂等表（只存摘要，服务端凭证按需确定性派生）、
+               # 旧库迁移（含明文换发记录的摘要化改写）、游标编解码
   service.py   # 领域服务：时钟、凭证生成、轮换幂等与原因映射、后台回收线程、判定日志
   schema.py    # HTTP 请求/响应模型
   api.py       # FastAPI 工厂 create_app(service) 与错误码映射
@@ -242,8 +264,9 @@ tests/         # 生命周期/失败原因、并发、过期回收、重启一�
 ## 9. 验证方法
 
 ```bash
-uv run pytest -s          # -s 可看到每个请求的输入与判定依据日志
+uv run pytest -s          # -s 可看到每个用例的 CASE START/PASSED 及每个请求的输入与判定依据日志
 uv run pytest             # 连续多次执行结果稳定（测试不依赖真实时间与 sleep 竞态）
+uv run pytest -v          # 按业务文件列出全部用例及逐项结果
 ```
 
 重点边界场景均有对应测试：
@@ -255,9 +278,17 @@ uv run pytest             # 连续多次执行结果稳定（测试不依赖真�
 - 非法续约/释放：凭证错误、已释放、已到期、租约不存在分别得到不同 code。
 - 凭证换发：正常换发后旧凭证对续约/释放/再换发立即失效；同请求号重放返回同一新凭证；
   12 线程同请求号并发仅 1 次 `ROTATED`、11 次 `REPLAYED`；不同请求号并发仅 1 个真正成功；
-  请求号复用为不同参数得到 `rotation_conflict`；到期/已回收租约换发被拒且不会复活或延期；
+  请求号复用为不同参数（不同租约/旧凭证/新凭证）得到 `rotation_conflict`；
+  到期/已回收租约换发被拒且不会复活或延期；
   换发不延长 TTL，回收按原时间生效；重启后重放仍返回同一凭证；旧库可平滑迁移；
   历史只暴露换发事实而不含新旧凭证；换发与回收穿插时分页无重复无遗漏。
+- 换发的重试安全性（`tests/test_rotation_retry_safety.py`）：
+  缺少请求号时在任何状态改动之前被拒绝（连惰性过期都不触发），旧凭证仍可用；
+  时间推进后重试仍返回**首次换发的时间戳**与同一凭证；并发同键提交的结果逐字段一致；
+  进程重启后重放结果与结论不变（两种凭证来源都覆盖）；
+  落盘的换发记录与历史事件不含任何凭证明文，已失效旧凭证全库无残留；
+  早期明文记录的旧库会被迁移为摘要记录（调用方来源可重放、服务端来源明确拒绝）；
+  换发与回收器并发交叉时状态自洽（到期仅一次、换发不延期）。
 - 两种凭证来源（调用方自带 / 服务端生成）均有从申请 → 换发 → 续约 → 释放的完整链路用例。
 - 重启一致性：关闭服务后以新服务、新时钟打开同一文件，到期判定与历史不变。
 - 分页与历史：7 条租约分 3 页遍历无重复无遗漏；终态行不消失；资源级事件链完整。

@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 import secrets
 import threading
-import uuid
 from pathlib import Path
 
 from .errors import (
@@ -22,6 +21,7 @@ from .errors import (
     LeaseNotFoundError,
     LeaseReleasedError,
     RotationConflictError,
+    RotationRequestIdRequiredError,
 )
 from .ids import IdGenerator, UuidLeaseIdGenerator
 from .model import (
@@ -218,19 +218,34 @@ class LeaseService:
         same lease id, fencing token and expiry time; only the credential
         (and its version) changes.
 
-        ``request_id`` is the idempotency key. Retries and concurrent
-        duplicates carrying the same key and parameters converge to one
-        rotation: the first call is ``ROTATED``, later ones are ``REPLAYED``
-        and hand back the same credential. Reusing a key for a different
-        request raises :class:`RotationConflictError`. When omitted, the
-        server assigns a fresh key, so such a call cannot be retried
-        transparently.
+        ``request_id`` is the idempotency key and is **mandatory**. Retries
+        and concurrent duplicates carrying the same key and parameters
+        converge to one rotation: the first call is ``ROTATED``, later ones
+        are ``REPLAYED`` and hand back the same credential and the original
+        rotation timestamp. Reusing a key for a different request raises
+        :class:`RotationConflictError`.
+
+        A call without ``request_id`` is rejected with
+        :class:`RotationRequestIdRequiredError` *before* any state is
+        inspected or changed (not even a lazy expiry is triggered). This
+        guarantees there is no window where the old credential is already
+        dead but the caller — whose response was lost — cannot recover the
+        new credential, because nothing was ever applied.
         """
+        if not request_id or not request_id.strip():
+            logger.warning(
+                "rotate rejected lease_id=%s: missing request_id "
+                "(no state inspected or changed)", lease_id,
+            )
+            raise RotationRequestIdRequiredError(
+                "credential rotation requires a caller-supplied request_id "
+                "so a lost response can be recovered by retrying with the "
+                "same idempotency key"
+            )
         if not credential:
             raise ValueError("credential must be a non-empty string")
         if new_credential is not None and not new_credential:
             raise ValueError("new_credential must be a non-empty string when given")
-        request_id = request_id or f"srv-{uuid.uuid4().hex}"
         now_ms = self._clock.now_ms()
         logger.info(
             "rotate request lease_id=%s request_id=%s now_ms=%s "
@@ -252,7 +267,7 @@ class LeaseService:
             status=status,
             credential=str(outcome["credential"]),
             credential_version=int(outcome["credential_version"]),
-            rotated_at_ms=now_ms,
+            rotated_at_ms=int(outcome["rotated_at_ms"]),
             lease=lease,
         )
         logger.info(
@@ -290,6 +305,17 @@ class LeaseService:
         if reason == "same_credential":
             raise ValueError(
                 "new credential must differ from the current credential"
+            )
+        if reason == "legacy_replay":
+            logger.warning(
+                "rotate rejected lease_id=%s request_id=%s: rotation record "
+                "predates deterministic credentials and cannot be replayed",
+                lease_id, request_id,
+            )
+            raise RotationConflictError(
+                f"rotation {request_id} was recorded by an older release "
+                f"that stored credentials directly; its result cannot be "
+                f"reconstructed, please rotate again with a new request id"
             )
         # Other reasons share the lease-scoped decision vocabulary.
         self._raise_for_reason(reason, lease, "rotate")

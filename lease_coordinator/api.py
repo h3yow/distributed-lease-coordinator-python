@@ -14,6 +14,7 @@ from .errors import (
     LeaseNotFoundError,
     LeaseReleasedError,
     RotationConflictError,
+    RotationRequestIdRequiredError,
 )
 from .model import EventPage, Lease, LeaseEvent, LeasePage
 from .schema import (
@@ -40,6 +41,7 @@ _ERROR_STATUS: dict[type[LeaseError], int] = {
     LeaseReleasedError: 409,
     InvalidCursorError: 400,
     RotationConflictError: 409,
+    RotationRequestIdRequiredError: 400,
 }
 
 

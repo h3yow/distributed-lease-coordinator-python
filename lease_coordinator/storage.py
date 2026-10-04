@@ -17,6 +17,8 @@ Concurrency notes
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import secrets
 import sqlite3
 import threading
@@ -33,6 +35,15 @@ CREDENTIAL_BYTES = 16
 def _generate_credential() -> str:
     """Generate a fresh server-side holder credential."""
     return secrets.token_hex(CREDENTIAL_BYTES)
+
+
+def _hash_credential(value: str) -> str:
+    """One-way digest of credential material for at-rest records.
+
+    Rotation records persist only this digest, never the credential
+    itself, so a dump of the database reveals no usable secret.
+    """
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -60,19 +71,34 @@ CREATE TABLE IF NOT EXISTS leases (
 );
 CREATE INDEX IF NOT EXISTS idx_leases_resource ON leases(resource_id, lease_id);
 
+-- Server-local key material (e.g. the rotation derivation secret). The
+-- secret itself is not a holder credential; holder credentials are never
+-- stored in this table.
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 -- One row per *successful* rotation request. The primary key is the
--- client-supplied (or server-assigned) idempotency key, so retries and
--- duplicate/concurrent submissions resolve to the exact same outcome.
--- Resulting credentials live only here, never in lease snapshots/events.
+-- client-supplied idempotency key, so retries and duplicate/concurrent
+-- submissions resolve to the exact same outcome.
+--
+-- No credential is ever stored in plaintext here: only SHA-256 digests of
+-- the presented old credential and (for caller-supplied ones) the new
+-- credential are kept, purely to detect idempotency-key misuse. A
+-- server-generated new credential is *derived deterministically* from the
+-- server-side rotation secret plus (lease_id, request_id), so a replay can
+-- reconstruct it on demand without the database ever containing it.
 CREATE TABLE IF NOT EXISTS credential_rotations (
-    request_id            TEXT PRIMARY KEY,
-    lease_id              TEXT NOT NULL,
-    resource_id           TEXT NOT NULL,
-    sequence_no           INTEGER NOT NULL,
-    credential_source     TEXT NOT NULL,
-    requested_credential  TEXT,
-    resulting_credential  TEXT NOT NULL,
-    rotated_at_ms         INTEGER NOT NULL
+    request_id                TEXT PRIMARY KEY,
+    lease_id                  TEXT NOT NULL,
+    resource_id               TEXT NOT NULL,
+    sequence_no               INTEGER NOT NULL,
+    credential_source         TEXT NOT NULL,
+    requested_credential_hash TEXT NOT NULL,
+    requested_new_hash        TEXT,
+    resulting_credential_hash TEXT NOT NULL,
+    rotated_at_ms             INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_rotations_lease
     ON credential_rotations(lease_id, rotated_at_ms);
@@ -189,16 +215,133 @@ class LeaseStorage:
         with self._write_lock:
             conn.executescript(SCHEMA_SQL)
             self._migrate(conn)
+            self._rotation_secret = self._load_or_create_rotation_secret(conn)
 
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
-        """Upgrade databases created before credential rotation existed."""
+        """Upgrade databases created by older releases."""
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(leases)")}
         if "credential_version" not in cols:
             conn.execute(
                 "ALTER TABLE leases ADD COLUMN credential_version "
                 "INTEGER NOT NULL DEFAULT 0"
             )
+        LeaseStorage._migrate_rotation_table(conn)
+
+    @staticmethod
+    def _migrate_rotation_table(conn: sqlite3.Connection) -> None:
+        """Replace plaintext rotation records with digest-only records.
+
+        Releases before the digest-only schema stored the presented old
+        credential and the resulting credential in plaintext. Those rows
+        are rewritten in place: presented/resulting credentials are
+        replaced by their SHA-256 digests. Caller-supplied results stay
+        replayable (the caller re-presents the new credential on retry);
+        server-generated legacy results cannot be reconstructed
+        deterministically and are marked ``server_legacy`` so a replay
+        fails explicitly instead of returning a wrong credential.
+        """
+        tables = {
+            r["name"]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if "credential_rotations" not in tables:
+            return
+        cols = {
+            r["name"]
+            for r in conn.execute("PRAGMA table_info(credential_rotations)")
+        }
+        if "requested_credential" not in cols:
+            return  # already the digest-only shape
+        conn.execute(
+            "ALTER TABLE credential_rotations "
+            "RENAME TO credential_rotations_legacy"
+        )
+        conn.execute(
+            """
+            CREATE TABLE credential_rotations (
+                request_id                TEXT PRIMARY KEY,
+                lease_id                  TEXT NOT NULL,
+                resource_id               TEXT NOT NULL,
+                sequence_no               INTEGER NOT NULL,
+                credential_source         TEXT NOT NULL,
+                requested_credential_hash TEXT NOT NULL,
+                requested_new_hash        TEXT,
+                resulting_credential_hash TEXT NOT NULL,
+                rotated_at_ms             INTEGER NOT NULL
+            )
+            """
+        )
+        legacy_rows = conn.execute(
+            "SELECT * FROM credential_rotations_legacy"
+        ).fetchall()
+        for row in legacy_rows:
+            source = row["credential_source"]
+            if source == "caller":
+                # For caller-supplied rotations the resulting credential is
+                # exactly the credential the caller requested; keeping only
+                # its digest still lets a retry re-present and verify it.
+                new_source = "caller"
+                requested_new_hash = _hash_credential(row["resulting_credential"])
+            else:
+                new_source = "server_legacy"
+                requested_new_hash = None
+            conn.execute(
+                """
+                INSERT INTO credential_rotations
+                    (request_id, lease_id, resource_id, sequence_no,
+                     credential_source, requested_credential_hash,
+                     requested_new_hash, resulting_credential_hash,
+                     rotated_at_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["request_id"], row["lease_id"], row["resource_id"],
+                    int(row["sequence_no"]), new_source,
+                    _hash_credential(row["requested_credential"]),
+                    requested_new_hash,
+                    _hash_credential(row["resulting_credential"]),
+                    int(row["rotated_at_ms"]),
+                ),
+            )
+        conn.execute("DROP TABLE credential_rotations_legacy")
+
+    @staticmethod
+    def _load_or_create_rotation_secret(conn: sqlite3.Connection) -> str:
+        """Return the persisted derivation secret, creating it on first use.
+
+        The secret lives only in this database; losing it would make
+        previously issued server-generated credentials non-reconstructable,
+        so it is created once and never rotated automatically.
+        """
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = 'rotation_secret'"
+        ).fetchone()
+        if row is not None:
+            return str(row["value"])
+        secret = secrets.token_hex(32)
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('rotation_secret', ?)",
+            (secret,),
+        )
+        return secret
+
+    def _derive_credential(self, lease_id: str, request_id: str) -> str:
+        """Deterministically derive a server-generated rotation credential.
+
+        Same ``(lease_id, request_id)`` always yields the same credential,
+        which is what makes idempotent replays possible without ever
+        persisting the credential itself. The output is 32 hex chars,
+        matching :func:`_generate_credential` in shape.
+        """
+        digest = hmac.new(
+            self._rotation_secret.encode("ascii"),
+            f"credential-rotation:{lease_id}:{request_id}".encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+        return digest[:CREDENTIAL_BYTES].hex()
 
     def close(self) -> None:
         with self._write_lock:
@@ -519,17 +662,23 @@ class LeaseStorage:
         Returns ``(outcome, lease, reason)``.
 
         * ``outcome`` is ``{"status": "rotated"|"replayed", "credential": str,
-          "credential_version": int, "request_id": str}``.
+          "credential_version": int, "request_id": str,
+          "rotated_at_ms": int}``; ``rotated_at_ms`` is always the moment of
+          the *actual* rotation, never the moment of a replay.
         * ``reason`` is one of ``not_found`` / ``bad_credential`` /
           ``released`` / ``expired`` / ``request_conflict`` /
-          ``same_credential``; when it is set, nothing has changed.
+          ``same_credential`` / ``legacy_replay``; when it is set, nothing
+          has changed.
 
         Idempotency: ``request_id`` is the primary key of
         ``credential_rotations``. A repeated identical request (including a
         retry after process restart or a concurrent duplicate) returns the
-        stored result as ``replayed``. The same key reused for a different
-        lease/credential fails with ``request_conflict`` without touching
-        anything.
+        stored result as ``replayed`` — for a server-generated credential
+        the same value is re-derived deterministically, for a
+        caller-supplied one the re-presented ``new_credential`` is verified
+        against the stored digest and handed back. The same key reused with
+        a different lease, old credential or new credential fails with
+        ``request_conflict`` without touching anything.
 
         Expiry interaction: rotation never extends or shortens the lease;
         if ``expires_at_ms <= now_ms`` the lease is expired inside this
@@ -548,8 +697,30 @@ class LeaseStorage:
                 (request_id,),
             ).fetchone()
             if dup is not None:
-                if dup["lease_id"] != lease_id or dup["requested_credential"] != credential:
+                if (
+                    dup["lease_id"] != lease_id
+                    or dup["requested_credential_hash"] != _hash_credential(credential)
+                ):
                     return None, None, "request_conflict"
+                source = str(dup["credential_source"])
+                if source == "server_legacy":
+                    # Migrated from a release that stored the credential in
+                    # plaintext; it cannot be reconstructed deterministically.
+                    return None, None, "legacy_replay"
+                if source == "caller":
+                    if (
+                        new_credential is None
+                        or _hash_credential(new_credential)
+                        != dup["requested_new_hash"]
+                    ):
+                        return None, None, "request_conflict"
+                    final = new_credential
+                else:  # server-generated: re-derive the very same credential
+                    if new_credential is not None:
+                        return None, None, "request_conflict"
+                    final = self._derive_credential(lease_id, request_id)
+                    if _hash_credential(final) != dup["resulting_credential_hash"]:
+                        return None, None, "legacy_replay"
                 lease = self._row_to_lease(
                     conn.execute(
                         "SELECT * FROM leases WHERE lease_id = ?", (lease_id,)
@@ -558,9 +729,10 @@ class LeaseStorage:
                 return (
                     {
                         "status": "replayed",
-                        "credential": dup["resulting_credential"],
+                        "credential": final,
                         "credential_version": int(dup["sequence_no"]),
                         "request_id": request_id,
+                        "rotated_at_ms": int(dup["rotated_at_ms"]),
                     },
                     lease,
                     None,
@@ -598,7 +770,11 @@ class LeaseStorage:
                 return None, current, "expired"
 
             source = "caller" if new_credential is not None else "server"
-            final_new = new_credential or _generate_credential()
+            final_new = (
+                new_credential
+                if new_credential is not None
+                else self._derive_credential(lease_id, request_id)
+            )
             if final_new == credential:
                 return None, current, "same_credential"
 
@@ -629,12 +805,18 @@ class LeaseStorage:
                 """
                 INSERT INTO credential_rotations
                     (request_id, lease_id, resource_id, sequence_no,
-                     credential_source, requested_credential,
-                     resulting_credential, rotated_at_ms)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     credential_source, requested_credential_hash,
+                     requested_new_hash, resulting_credential_hash,
+                     rotated_at_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (request_id, lease_id, current.resource_id, new_version,
-                 source, credential, final_new, now_ms),
+                (
+                    request_id, lease_id, current.resource_id, new_version,
+                    source, _hash_credential(credential),
+                    _hash_credential(new_credential)
+                    if new_credential is not None else None,
+                    _hash_credential(final_new), now_ms,
+                ),
             )
             self._insert_event(
                 conn, lease_id, current.resource_id, "CREDENTIAL_ROTATED",
@@ -653,6 +835,7 @@ class LeaseStorage:
                     "credential": final_new,
                     "credential_version": new_version,
                     "request_id": request_id,
+                    "rotated_at_ms": now_ms,
                 },
                 rotated,
                 None,

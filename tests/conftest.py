@@ -49,3 +49,18 @@ def _configure_logging() -> None:
 
 
 _configure_logging()
+
+_case_logger = logging.getLogger("lease_coordinator")
+
+
+def pytest_runtest_logstart(nodeid: str) -> None:
+    """Log the start of every case so the run shows what is covered."""
+    _case_logger.info("CASE START %s", nodeid)
+
+
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    """Log the outcome of every case next to its decision logs."""
+    if report.when == "call":
+        _case_logger.info(
+            "CASE %s %s", report.outcome.upper(), report.nodeid
+        )
