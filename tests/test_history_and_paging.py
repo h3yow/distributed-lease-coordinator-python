@@ -13,12 +13,13 @@ from lease_coordinator.storage import decode_cursor, encode_cursor
 def test_lease_listing_never_drops_expired_or_released_rows(
     service: LeaseService, clock: FakeClock
 ) -> None:
-    a = service.acquire("r-a", "A", ttl_ms=100)
-    b = service.acquire("r-b", "B", ttl_ms=1000)
-    c = service.acquire("r-c", "C", ttl_ms=1000)
+    a = service.acquire("r-a", "A", ttl_ms=100).lease
+    b_res = service.acquire("r-b", "B", ttl_ms=1000)
+    b = b_res.lease
+    c = service.acquire("r-c", "C", ttl_ms=1000).lease
     clock.advance(101)
     service.expire_due_leases()
-    service.release(b.lease_id, b.credential)
+    service.release(b.lease_id, b_res.credential)
 
     all_rows = service.list_leases(limit=100).items
     ids = {row.lease_id for row in all_rows}
@@ -57,11 +58,12 @@ def test_cursor_is_opaque_and_validated(service: LeaseService) -> None:
 def test_full_transition_history_is_recorded_for_a_lease(
     service: LeaseService, clock: FakeClock
 ) -> None:
-    lease = service.acquire("r", "A", ttl_ms=1000)
+    acquired = service.acquire("r", "A", ttl_ms=1000)
+    lease = acquired.lease
     clock.advance(10)
-    service.renew(lease.lease_id, lease.credential, ttl_ms=1000)
+    service.renew(lease.lease_id, acquired.credential, ttl_ms=1000)
     clock.advance(10)
-    service.release(lease.lease_id, lease.credential)
+    service.release(lease.lease_id, acquired.credential)
 
     events = service.list_events_for_lease(lease.lease_id, limit=100).items
     chain = [(e.event_type, e.from_status, e.to_status) for e in events]
@@ -79,7 +81,7 @@ def test_full_transition_history_is_recorded_for_a_lease(
 def test_expiry_history_is_recorded_even_when_it_happens_lazily(
     service: LeaseService, clock: FakeClock
 ) -> None:
-    lease = service.acquire("r", "A", ttl_ms=1000)
+    lease = service.acquire("r", "A", ttl_ms=1000).lease
     clock.advance(1001)
     service.acquire("r", "B", ttl_ms=1000)  # lazily expires the first one
 
@@ -94,10 +96,11 @@ def test_expiry_history_is_recorded_even_when_it_happens_lazily(
 
 
 def test_event_pagination_for_resource(service: LeaseService, clock: FakeClock) -> None:
-    lease = service.acquire("r", "A", ttl_ms=1000)
+    acquired = service.acquire("r", "A", ttl_ms=1000)
+    lease = acquired.lease
     for i in range(5):
         clock.advance(10)
-        service.renew(lease.lease_id, lease.credential, ttl_ms=1000)
+        service.renew(lease.lease_id, acquired.credential, ttl_ms=1000)
 
     seen: list[int] = []
     cursor = None

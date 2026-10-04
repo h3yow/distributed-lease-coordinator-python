@@ -26,8 +26,8 @@ def test_only_one_winner_under_concurrent_acquire(tmp_path: Path) -> None:
     def attempt(idx: int) -> None:
         barrier.wait()
         try:
-            lease = svc.acquire("hot-resource", f"client-{idx}", ttl_ms=60_000)
-            winners.append(lease.lease_id)
+            result = svc.acquire("hot-resource", f"client-{idx}", ttl_ms=60_000)
+            winners.append(result.lease.lease_id)
         except LeaseConflictError:
             rejected.append(f"client-{idx}")
 
@@ -50,7 +50,7 @@ def test_in_memory_shared_storage_also_serializes_racers(service: LeaseService) 
     def attempt(idx: int) -> None:
         barrier.wait()
         try:
-            winners.append(service.acquire("r", f"c{idx}", ttl_ms=1000).lease_id)
+            winners.append(service.acquire("r", f"c{idx}", ttl_ms=1000).lease.lease_id)
         except Exception as exc:  # noqa: BLE001 - want to surface any non-conflict
             errors.append(exc)
 
@@ -63,7 +63,7 @@ def test_in_memory_shared_storage_also_serializes_racers(service: LeaseService) 
 
 
 def test_expired_lease_is_reaped_at_most_once(service: LeaseService, clock: FakeClock) -> None:
-    lease = service.acquire("r", "c", ttl_ms=1_000)
+    lease = service.acquire("r", "c", ttl_ms=1_000).lease
     clock.advance(1_001)
 
     first_pass = service.expire_due_leases()
@@ -83,11 +83,11 @@ def test_expired_lease_is_reaped_at_most_once(service: LeaseService, clock: Fake
 def test_expiry_then_acquire_grants_new_holder_with_new_token(
     service: LeaseService, clock: FakeClock
 ) -> None:
-    first = service.acquire("r", "A", ttl_ms=1_000)
+    first = service.acquire("r", "A", ttl_ms=1_000).lease
     clock.advance(1_001)
     service.expire_due_leases()
 
-    second = service.acquire("r", "B", ttl_ms=1_000)
+    second = service.acquire("r", "B", ttl_ms=1_000).lease
 
     assert second.fencing_token == 2
     assert service.get_lease(first.lease_id).status is LeaseStatus.EXPIRED
@@ -97,10 +97,10 @@ def test_expiry_then_acquire_grants_new_holder_with_new_token(
 def test_lazy_expiry_during_acquire_frees_slot_without_explicit_reap(
     service: LeaseService, clock: FakeClock
 ) -> None:
-    first = service.acquire("r", "A", ttl_ms=1_000)
+    first = service.acquire("r", "A", ttl_ms=1_000).lease
     clock.advance(1_001)
 
-    second = service.acquire("r", "B", ttl_ms=1_000)  # must lazily expire first
+    second = service.acquire("r", "B", ttl_ms=1_000).lease  # must lazily expire first
 
     assert second.fencing_token == 2
     assert service.get_lease(first.lease_id).status is LeaseStatus.EXPIRED
@@ -110,7 +110,7 @@ def test_lazy_expiry_during_acquire_frees_slot_without_explicit_reap(
 def test_background_reaper_eventually_expires_due_leases(
     service: LeaseService, clock: FakeClock
 ) -> None:
-    lease = service.acquire("r", "A", ttl_ms=1_000)
+    lease = service.acquire("r", "A", ttl_ms=1_000).lease
     service.start_reaper(interval_ms=20)
     clock.advance(1_001)
 
@@ -128,8 +128,9 @@ def test_state_is_consistent_after_process_restart(tmp_path: Path) -> None:
     db = tmp_path / "persist.db"
     clock = FakeClock(current_ms=5_000)
     svc1 = LeaseService(db_path=db, clock=clock, id_generator=_PrefixIds("lease"))
-    lease = svc1.acquire("r", "A", ttl_ms=1_000)
-    svc1.renew(lease.lease_id, lease.credential, ttl_ms=2_000)  # expiry -> 7000
+    acquired = svc1.acquire("r", "A", ttl_ms=1_000)
+    lease = acquired.lease
+    svc1.renew(lease.lease_id, acquired.credential, ttl_ms=2_000)  # expiry -> 7000
     svc1.close()
 
     # "Restart": a new service/clock continues from a later point in time.
@@ -142,7 +143,7 @@ def test_state_is_consistent_after_process_restart(tmp_path: Path) -> None:
     from lease_coordinator.errors import LeaseExpiredError
 
     with pytest.raises(LeaseExpiredError):
-        svc2.renew(lease.lease_id, lease.credential, ttl_ms=10_000)
+        svc2.renew(lease.lease_id, acquired.credential, ttl_ms=10_000)
 
     # History survived the restart and is still queryable.
     events = svc2.list_events_for_lease(lease.lease_id).items
@@ -156,14 +157,14 @@ def test_two_services_on_same_file_do_not_double_grant(tmp_path: Path) -> None:
     svc_a = LeaseService(db_path=db, clock=clock, id_generator=UuidLeaseIdGenerator())
     svc_b = LeaseService(db_path=db, clock=clock, id_generator=UuidLeaseIdGenerator())
 
-    a_wins = svc_a.acquire("shared", "A", ttl_ms=1000)
+    a_wins = svc_a.acquire("shared", "A", ttl_ms=1000).lease
     with pytest.raises(LeaseConflictError):
         svc_b.acquire("shared", "B", ttl_ms=1000)
 
     # Expiry performed by service A is visible to service B; B may then win.
     clock.advance(1001)
     svc_a.expire_due_leases()
-    b_lease = svc_b.acquire("shared", "B", ttl_ms=1000)
+    b_lease = svc_b.acquire("shared", "B", ttl_ms=1000).lease
     assert b_lease.fencing_token == a_wins.fencing_token + 1
     svc_a.close()
     svc_b.close()
@@ -184,13 +185,17 @@ class _PrefixIds:
 def test_direct_storage_restart_with_file(tmp_path: Path) -> None:
     db = tmp_path / "s.db"
     st = LeaseStorage(db)
-    tok, conflict = st.atomic_acquire("r", "l1", "h", "c", 0, 100)
+    tok, conflict = st.atomic_acquire(
+        "r", "l1", "h", st.codec.fingerprint("c"), 0, 100
+    )
     assert tok == 1 and conflict is None
     st.close()
 
     st2 = LeaseStorage(db)
     lease = st2.get_lease("l1")
     assert lease is not None and lease.fencing_token == 1
-    tok, conflict = st2.atomic_acquire("r", "l2", "h", "c", 50, 200)
+    tok, conflict = st2.atomic_acquire(
+        "r", "l2", "h", st2.codec.fingerprint("c"), 50, 200
+    )
     assert conflict is not None and tok == 0
     st2.close()

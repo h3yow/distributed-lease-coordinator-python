@@ -13,11 +13,13 @@ from .errors import (
     LeaseExpiredError,
     LeaseNotFoundError,
     LeaseReleasedError,
+    MissingRequestIdError,
     RotationConflictError,
 )
 from .model import EventPage, Lease, LeaseEvent, LeasePage
 from .schema import (
     AcquireRequest,
+    AcquireView,
     EventPageView,
     EventView,
     LeasePageView,
@@ -31,7 +33,7 @@ from .service import LeaseService
 
 # Error codes are part of the public contract so clients can distinguish
 # rejection reasons (409 conflict family, 404 missing, 403 wrong credential,
-# 400 bad cursor).
+# 400 bad cursor / missing idempotency key).
 _ERROR_STATUS: dict[type[LeaseError], int] = {
     LeaseNotFoundError: 404,
     LeaseConflictError: 409,
@@ -39,6 +41,7 @@ _ERROR_STATUS: dict[type[LeaseError], int] = {
     LeaseExpiredError: 409,
     LeaseReleasedError: 409,
     InvalidCursorError: 400,
+    MissingRequestIdError: 400,
     RotationConflictError: 409,
 }
 
@@ -57,6 +60,12 @@ def _lease_view(lease: Lease) -> LeaseView:
         version=lease.version,
         credential_version=lease.credential_version,
     )
+
+
+def _acquire_view(result) -> AcquireView:
+    """Acquire is the one place the initial credential is delivered."""
+    view = _lease_view(result.lease)
+    return AcquireView(**view.model_dump(), credential=result.credential)
 
 
 def _rotation_view(rotation) -> RotationView:
@@ -126,15 +135,15 @@ def create_app(service: LeaseService) -> FastAPI:
             },
         )
 
-    @application.post("/leases", response_model=LeaseView, status_code=201)
-    def acquire_lease(body: AcquireRequest) -> LeaseView:
-        lease = service.acquire(
+    @application.post("/leases", response_model=AcquireView, status_code=201)
+    def acquire_lease(body: AcquireRequest) -> AcquireView:
+        result = service.acquire(
             resource_id=body.resource_id,
             holder=body.holder,
             ttl_ms=body.ttl_ms,
             credential=body.credential,
         )
-        return _lease_view(lease)
+        return _acquire_view(result)
 
     @application.get("/leases", response_model=LeasePageView)
     def list_leases(limit: int = 50, cursor: str | None = None) -> LeasePageView:

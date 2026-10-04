@@ -23,12 +23,18 @@ class LeaseStatus(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class Lease:
-    """An immutable snapshot of one lease record."""
+    """An immutable snapshot of one lease record.
+
+    ``credential_hash`` is the at-rest fingerprint of the holder
+    credential: snapshots, listings and history never carry credential
+    material itself. The plaintext credential exists only in the
+    :class:`AcquireResult` / :class:`CredentialRotation` that delivered it.
+    """
 
     lease_id: str
     resource_id: str
     holder: str
-    credential: str
+    credential_hash: str
     fencing_token: int
     status: LeaseStatus
     acquired_at_ms: int
@@ -37,6 +43,18 @@ class Lease:
     expire_reason: str | None = None
     version: int = 0
     credential_version: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class AcquireResult:
+    """Result of acquiring a lease.
+
+    The initial holder credential is delivered *once*, here, at acquire
+    time. It is never repeated by later queries.
+    """
+
+    lease: Lease
+    credential: str
 
 
 class RotationStatus(str, Enum):

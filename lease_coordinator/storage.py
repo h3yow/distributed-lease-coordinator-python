@@ -17,7 +17,8 @@ Concurrency notes
 from __future__ import annotations
 
 import base64
-import secrets
+import hmac
+import json
 import sqlite3
 import threading
 import time
@@ -25,14 +26,8 @@ import uuid
 from pathlib import Path
 from typing import Callable, TypeVar
 
+from .crypto import CredentialCodec, generate_key, load_or_create_key
 from .model import EventPage, Lease, LeaseEvent, LeasePage, LeaseStatus
-
-CREDENTIAL_BYTES = 16
-
-
-def _generate_credential() -> str:
-    """Generate a fresh server-side holder credential."""
-    return secrets.token_hex(CREDENTIAL_BYTES)
 
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -44,11 +39,15 @@ CREATE TABLE IF NOT EXISTS resources (
     fencing_seq   INTEGER NOT NULL DEFAULT 0
 );
 
+-- Lease rows carry only a keyed *fingerprint* of the current holder
+-- credential, never the credential itself. An operator inspecting the file
+-- can see holder/version/facts but cannot recover or verify a credential
+-- without the separate server key.
 CREATE TABLE IF NOT EXISTS leases (
     lease_id           TEXT PRIMARY KEY,
     resource_id        TEXT NOT NULL,
     holder             TEXT NOT NULL,
-    credential         TEXT NOT NULL,
+    credential_hash    TEXT NOT NULL,
     fencing_token      INTEGER NOT NULL,
     status             TEXT NOT NULL,
     acquired_at_ms     INTEGER NOT NULL,
@@ -61,18 +60,24 @@ CREATE TABLE IF NOT EXISTS leases (
 CREATE INDEX IF NOT EXISTS idx_leases_resource ON leases(resource_id, lease_id);
 
 -- One row per *successful* rotation request. The primary key is the
--- client-supplied (or server-assigned) idempotency key, so retries and
--- duplicate/concurrent submissions resolve to the exact same outcome.
--- Resulting credentials live only here, never in lease snapshots/events.
+-- caller-supplied idempotency key, so retries and duplicate/concurrent
+-- submissions resolve to the exact same outcome. The presented old
+-- credential is kept only as a fingerprint; the resulting credential is
+-- kept authenticated-encrypted so replays (even after restart) can hand
+-- back the identical secret while the database itself holds no plaintext.
+-- lease_snapshot freezes the lease facts as of the rotation so a replay
+-- returns exactly the first outcome regardless of later renewals/expiry.
 CREATE TABLE IF NOT EXISTS credential_rotations (
-    request_id            TEXT PRIMARY KEY,
-    lease_id              TEXT NOT NULL,
-    resource_id           TEXT NOT NULL,
-    sequence_no           INTEGER NOT NULL,
-    credential_source     TEXT NOT NULL,
-    requested_credential  TEXT,
-    resulting_credential  TEXT NOT NULL,
-    rotated_at_ms         INTEGER NOT NULL
+    request_id                TEXT PRIMARY KEY,
+    lease_id                  TEXT NOT NULL,
+    resource_id               TEXT NOT NULL,
+    sequence_no               INTEGER NOT NULL,
+    credential_source         TEXT NOT NULL,
+    requested_fingerprint     TEXT NOT NULL,
+    new_fingerprint           TEXT NOT NULL,
+    sealed_result_credential  TEXT NOT NULL,
+    rotated_at_ms             INTEGER NOT NULL,
+    lease_snapshot            TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_rotations_lease
     ON credential_rotations(lease_id, rotated_at_ms);
@@ -116,8 +121,24 @@ def decode_cursor(cursor: str) -> int:
 class LeaseStorage:
     """Thin data-access layer over a single SQLite database file."""
 
-    def __init__(self, db_path: str | Path = ":memory:") -> None:
+    def __init__(
+        self,
+        db_path: str | Path = ":memory:",
+        codec: CredentialCodec | None = None,
+    ) -> None:
         self._db_path = str(db_path)
+        # The codec keys all at-rest credential fingerprints and sealed
+        # credentials. For a file database it defaults to a sibling key file
+        # so data stays decryptable across process restarts; an in-memory
+        # database uses an ephemeral random key (nothing outlives the process).
+        if codec is not None:
+            self._codec = codec
+        elif self._db_path == ":memory:":
+            self._codec = CredentialCodec(generate_key())
+        else:
+            self._codec = CredentialCodec(
+                load_or_create_key(Path(self._db_path).with_suffix(".key"))
+            )
         # In-process write serialization. SQLite itself additionally
         # serializes writers across processes via its file lock.
         self._write_lock = threading.RLock()
@@ -189,16 +210,92 @@ class LeaseStorage:
         with self._write_lock:
             conn.executescript(SCHEMA_SQL)
             self._migrate(conn)
+            # Rewrite any legacy plaintext credential column atomically now
+            # that the new schema exists, so on-disk data never keeps it.
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(leases)")}
+            if "credential" in cols:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self._migrate_plaintext_credentials_txn(conn)
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+                else:
+                    conn.execute("COMMIT")
+
+    @property
+    def codec(self) -> CredentialCodec:
+        """The credential codec used by this storage (fingerprint/seal)."""
+        return self._codec
 
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
-        """Upgrade databases created before credential rotation existed."""
+        """Upgrade databases created before credentials were protected.
+
+        Older databases kept a plaintext ``credential`` column on leases and
+        may predate the rotations table. Rebuilding is done by callers that
+        know the codec key; :meth:`migrate_plaintext_credentials` performs it.
+        Here we only add the version column if a legacy leases table exists.
+        """
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(leases)")}
-        if "credential_version" not in cols:
+        if "credential_version" not in cols and "credential" in cols:
             conn.execute(
                 "ALTER TABLE leases ADD COLUMN credential_version "
                 "INTEGER NOT NULL DEFAULT 0"
             )
+
+    def migrate_plaintext_credentials(self) -> None:
+        """Convert a legacy plaintext-credential database to fingerprints.
+
+        Best-effort cleanup for files created by earlier development
+        versions: the plaintext column is dropped so on-disk data never
+        retains credential material. Idempotent on already-new databases.
+        """
+        conn = self._get_conn()
+        with self._write_lock:
+            self._with_transaction(
+                lambda c: self._migrate_plaintext_credentials_txn(c)
+            )
+
+    def _migrate_plaintext_credentials_txn(
+        self, conn: sqlite3.Connection,
+    ) -> None:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(leases)")}
+        if "credential" not in cols:
+            return
+        conn.execute(
+            """
+            CREATE TABLE leases_new (
+                lease_id TEXT PRIMARY KEY, resource_id TEXT NOT NULL,
+                holder TEXT NOT NULL, credential_hash TEXT NOT NULL,
+                fencing_token INTEGER NOT NULL, status TEXT NOT NULL,
+                acquired_at_ms INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL,
+                released_at_ms INTEGER, expire_reason TEXT,
+                version INTEGER NOT NULL DEFAULT 0,
+                credential_version INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        rows = conn.execute(
+            "SELECT * FROM leases"
+        ).fetchall()
+        for r in rows:
+            conn.execute(
+                "INSERT INTO leases_new VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    r["lease_id"], r["resource_id"], r["holder"],
+                    self._codec.fingerprint(r["credential"]),
+                    r["fencing_token"], r["status"], r["acquired_at_ms"],
+                    r["expires_at_ms"], r["released_at_ms"], r["expire_reason"],
+                    r["version"], r["credential_version"],
+                ),
+            )
+        conn.execute("DROP TABLE leases")
+        conn.execute("ALTER TABLE leases_new RENAME TO leases")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_leases_resource "
+            "ON leases(resource_id, lease_id)"
+        )
 
     def close(self) -> None:
         with self._write_lock:
@@ -215,7 +312,7 @@ class LeaseStorage:
             lease_id=row["lease_id"],
             resource_id=row["resource_id"],
             holder=row["holder"],
-            credential=row["credential"],
+            credential_hash=row["credential_hash"],
             fencing_token=row["fencing_token"],
             status=LeaseStatus(row["status"]),
             acquired_at_ms=row["acquired_at_ms"],
@@ -270,7 +367,7 @@ class LeaseStorage:
         resource_id: str,
         lease_id: str,
         holder: str,
-        credential: str,
+        credential_fingerprint: str,
         now_ms: int,
         expires_at_ms: int,
     ) -> tuple[int, Lease | None]:
@@ -317,12 +414,13 @@ class LeaseStorage:
             fencing_token = int(token_row["fencing_seq"])
             conn.execute(
                 """
-                INSERT INTO leases (lease_id, resource_id, holder, credential,
+                INSERT INTO leases (lease_id, resource_id, holder, credential_hash,
                     fencing_token, status, acquired_at_ms, expires_at_ms,
                     released_at_ms, expire_reason, version)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0)
                 """,
-                (lease_id, resource_id, holder, credential, fencing_token,
+                (lease_id, resource_id, holder, credential_fingerprint,
+                 fencing_token,
                  LeaseStatus.HELD.value, now_ms, expires_at_ms),
             )
             self._insert_event(
@@ -337,7 +435,7 @@ class LeaseStorage:
     def atomic_renew(
         self,
         lease_id: str,
-        credential: str,
+        credential_fingerprint: str,
         now_ms: int,
         expires_at_ms: int,
     ) -> tuple[Lease | None, str | None]:
@@ -354,7 +452,9 @@ class LeaseStorage:
             current = self._row_to_lease(row)
             if current is None:
                 return None, "not_found"
-            if current.credential != credential:
+            if not hmac.compare_digest(
+                current.credential_hash, credential_fingerprint
+            ):
                 return current, "bad_credential"
             if current.status is LeaseStatus.RELEASED:
                 return current, "released"
@@ -377,8 +477,9 @@ class LeaseStorage:
                 return current, "expired"
             cur = conn.execute(
                 "UPDATE leases SET expires_at_ms = ?, version = version + 1 "
-                "WHERE lease_id = ? AND status = ? AND credential = ? AND expires_at_ms > ?",
-                (expires_at_ms, lease_id, LeaseStatus.HELD.value, credential, now_ms),
+                "WHERE lease_id = ? AND status = ? AND credential_hash = ? AND expires_at_ms > ?",
+                (expires_at_ms, lease_id, LeaseStatus.HELD.value,
+                 credential_fingerprint, now_ms),
             )
             if cur.rowcount != 1:
                 # Lost a concurrent transition: re-read for an accurate reason.
@@ -402,7 +503,7 @@ class LeaseStorage:
     def atomic_release(
         self,
         lease_id: str,
-        credential: str,
+        credential_fingerprint: str,
         now_ms: int,
     ) -> tuple[Lease | None, str | None]:
         """Release a lease inside one database transaction.
@@ -418,7 +519,9 @@ class LeaseStorage:
             current = self._row_to_lease(row)
             if current is None:
                 return None, "not_found"
-            if current.credential != credential:
+            if not hmac.compare_digest(
+                current.credential_hash, credential_fingerprint
+            ):
                 return current, "bad_credential"
             if current.status is LeaseStatus.RELEASED:
                 return current, "released"
@@ -442,9 +545,9 @@ class LeaseStorage:
                 return expired, "expired"
             cur = conn.execute(
                 "UPDATE leases SET status = ?, released_at_ms = ?, version = version + 1 "
-                "WHERE lease_id = ? AND status = ? AND credential = ? AND expires_at_ms > ?",
+                "WHERE lease_id = ? AND status = ? AND credential_hash = ? AND expires_at_ms > ?",
                 (LeaseStatus.RELEASED.value, now_ms, lease_id,
-                 LeaseStatus.HELD.value, credential, now_ms),
+                 LeaseStatus.HELD.value, credential_fingerprint, now_ms),
             )
             if cur.rowcount != 1:
                 fresh = self._row_to_lease(
@@ -506,30 +609,80 @@ class LeaseStorage:
 
     # -- reads --------------------------------------------------------------
 
+    def _snapshot_json(self, lease: Lease) -> str:
+        """Freeze the rotation-time lease facts as canonical JSON."""
+        return json.dumps(
+            {
+                "lease_id": lease.lease_id,
+                "resource_id": lease.resource_id,
+                "holder": lease.holder,
+                "credential_hash": lease.credential_hash,
+                "fencing_token": lease.fencing_token,
+                "status": lease.status.value,
+                "acquired_at_ms": lease.acquired_at_ms,
+                "expires_at_ms": lease.expires_at_ms,
+                "released_at_ms": lease.released_at_ms,
+                "expire_reason": lease.expire_reason,
+                "version": lease.version,
+                "credential_version": lease.credential_version,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    @staticmethod
+    def _snapshot_to_lease(payload: str) -> Lease:
+        data = json.loads(payload)
+        return Lease(
+            lease_id=data["lease_id"],
+            resource_id=data["resource_id"],
+            holder=data["holder"],
+            credential_hash=data["credential_hash"],
+            fencing_token=data["fencing_token"],
+            status=LeaseStatus(data["status"]),
+            acquired_at_ms=data["acquired_at_ms"],
+            expires_at_ms=data["expires_at_ms"],
+            released_at_ms=data["released_at_ms"],
+            expire_reason=data["expire_reason"],
+            version=data["version"],
+            credential_version=data["credential_version"],
+        )
+
     def atomic_rotate_credential(
         self,
         lease_id: str,
-        credential: str,
-        new_credential: str | None,
+        presented_fingerprint: str,
+        new_fingerprint: str,
+        sealed_new_credential: str,
+        credential_source: str,
         request_id: str,
         now_ms: int,
     ) -> tuple[dict[str, object] | None, Lease | None, str | None]:
         """Swap the holder credential of one lease in a single transaction.
 
+        ``presented_fingerprint`` is the fingerprint of the credential the
+        caller proved it holds; ``new_fingerprint`` /
+        ``sealed_new_credential`` describe the replacement credential
+        (already fingerprinted and sealed by the caller with this storage's
+        codec).
+
         Returns ``(outcome, lease, reason)``.
 
-        * ``outcome`` is ``{"status": "rotated"|"replayed", "credential": str,
-          "credential_version": int, "request_id": str}``.
+        * ``outcome`` is ``{"status": "rotated"|"replayed", "credential":
+          str (plaintext, decrypted for delivery only),
+          "credential_version": int, "request_id": str,
+          "rotated_at_ms": int}``.
         * ``reason`` is one of ``not_found`` / ``bad_credential`` /
-          ``released`` / ``expired`` / ``request_conflict`` /
-          ``same_credential``; when it is set, nothing has changed.
+          ``released`` / ``expired`` / ``request_conflict``; when it is set,
+          nothing has changed.
 
         Idempotency: ``request_id`` is the primary key of
         ``credential_rotations``. A repeated identical request (including a
         retry after process restart or a concurrent duplicate) returns the
-        stored result as ``replayed``. The same key reused for a different
-        lease/credential fails with ``request_conflict`` without touching
-        anything.
+        stored result as ``replayed`` with the *original* rotation time and
+        the *frozen* lease snapshot, byte-identical in its facts. The same
+        key reused with a different lease or presented credential fails with
+        ``request_conflict`` without touching anything.
 
         Expiry interaction: rotation never extends or shortens the lease;
         if ``expires_at_ms <= now_ms`` the lease is expired inside this
@@ -548,21 +701,30 @@ class LeaseStorage:
                 (request_id,),
             ).fetchone()
             if dup is not None:
-                if dup["lease_id"] != lease_id or dup["requested_credential"] != credential:
+                if (
+                    dup["lease_id"] != lease_id
+                    or dup["requested_fingerprint"] != presented_fingerprint
+                ):
                     return None, None, "request_conflict"
-                lease = self._row_to_lease(
-                    conn.execute(
-                        "SELECT * FROM leases WHERE lease_id = ?", (lease_id,)
-                    ).fetchone()
-                )
+                try:
+                    delivered = self._codec.open(
+                        dup["sealed_result_credential"]
+                    )
+                except ValueError:
+                    # A key mismatch means this database/key pair cannot
+                    # safely reconstruct the committed result: fail loudly
+                    # rather than hand out a wrong credential.
+                    raise
+                frozen = self._snapshot_to_lease(dup["lease_snapshot"])
                 return (
                     {
                         "status": "replayed",
-                        "credential": dup["resulting_credential"],
+                        "credential": delivered,
                         "credential_version": int(dup["sequence_no"]),
                         "request_id": request_id,
+                        "rotated_at_ms": int(dup["rotated_at_ms"]),
                     },
-                    lease,
+                    frozen,
                     None,
                 )
 
@@ -572,7 +734,9 @@ class LeaseStorage:
             current = self._row_to_lease(row)
             if current is None:
                 return None, None, "not_found"
-            if current.credential != credential:
+            if not hmac.compare_digest(
+                current.credential_hash, presented_fingerprint
+            ):
                 return None, current, "bad_credential"
             if current.status is LeaseStatus.RELEASED:
                 return None, current, "released"
@@ -597,19 +761,14 @@ class LeaseStorage:
                     )
                 return None, current, "expired"
 
-            source = "caller" if new_credential is not None else "server"
-            final_new = new_credential or _generate_credential()
-            if final_new == credential:
-                return None, current, "same_credential"
-
             new_version = current.credential_version + 1
             cur = conn.execute(
-                "UPDATE leases SET credential = ?, credential_version = ?, "
+                "UPDATE leases SET credential_hash = ?, credential_version = ?, "
                 "version = version + 1 "
-                "WHERE lease_id = ? AND status = ? AND credential = ? "
+                "WHERE lease_id = ? AND status = ? AND credential_hash = ? "
                 "AND expires_at_ms > ?",
-                (final_new, new_version, lease_id, LeaseStatus.HELD.value,
-                 credential, now_ms),
+                (new_fingerprint, new_version, lease_id,
+                 LeaseStatus.HELD.value, presented_fingerprint, now_ms),
             )
             if cur.rowcount != 1:
                 # Lost a concurrent transition: re-read for an accurate reason.
@@ -620,39 +779,46 @@ class LeaseStorage:
                 )
                 if fresh is None:
                     return None, None, "not_found"
-                if fresh.credential != credential:
+                if not hmac.compare_digest(
+                    fresh.credential_hash, presented_fingerprint
+                ):
                     return None, fresh, "bad_credential"
                 if fresh.status is LeaseStatus.RELEASED:
                     return None, fresh, "released"
                 return None, fresh, "expired"
-            conn.execute(
-                """
-                INSERT INTO credential_rotations
-                    (request_id, lease_id, resource_id, sequence_no,
-                     credential_source, requested_credential,
-                     resulting_credential, rotated_at_ms)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (request_id, lease_id, current.resource_id, new_version,
-                 source, credential, final_new, now_ms),
-            )
-            self._insert_event(
-                conn, lease_id, current.resource_id, "CREDENTIAL_ROTATED",
-                now_ms, LeaseStatus.HELD.value, LeaseStatus.HELD.value,
-                f"credential_version {current.credential_version} -> {new_version} "
-                f"source={source} request_id={request_id}",
-            )
             rotated = self._row_to_lease(
                 conn.execute(
                     "SELECT * FROM leases WHERE lease_id = ?", (lease_id,)
                 ).fetchone()
             )
+            # The resulting credential is stored sealed; the frozen snapshot
+            # keeps the lease facts as of this exact rotation for replays.
+            conn.execute(
+                """
+                INSERT INTO credential_rotations
+                    (request_id, lease_id, resource_id, sequence_no,
+                     credential_source, requested_fingerprint, new_fingerprint,
+                     sealed_result_credential, rotated_at_ms, lease_snapshot)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (request_id, lease_id, current.resource_id, new_version,
+                 credential_source, presented_fingerprint, new_fingerprint,
+                 sealed_new_credential, now_ms,
+                 self._snapshot_json(rotated)),
+            )
+            self._insert_event(
+                conn, lease_id, current.resource_id, "CREDENTIAL_ROTATED",
+                now_ms, LeaseStatus.HELD.value, LeaseStatus.HELD.value,
+                f"credential_version {current.credential_version} -> {new_version} "
+                f"source={credential_source} request_id={request_id}",
+            )
             return (
                 {
                     "status": "rotated",
-                    "credential": final_new,
+                    "credential": self._codec.open(sealed_new_credential),
                     "credential_version": new_version,
                     "request_id": request_id,
+                    "rotated_at_ms": now_ms,
                 },
                 rotated,
                 None,

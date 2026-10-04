@@ -45,6 +45,20 @@ class InvalidCursorError(LeaseError):
     code = "invalid_cursor"
 
 
+class MissingRequestIdError(LeaseError):
+    """A rotation was submitted without a caller-supplied idempotency key.
+
+    The server deliberately does *not* assign one on the caller's behalf:
+    a server-assigned key could never be repeated by a retrying client, so
+    losing the first response would leave the old credential dead and the
+    new credential permanently unreachable. The request is therefore
+    rejected *before any state is changed*; callers must supply their own
+    stable ``request_id`` and may then retry safely.
+    """
+
+    code = "missing_request_id"
+
+
 class RotationConflictError(LeaseError):
     """A rotation request id was reused with different parameters.
 

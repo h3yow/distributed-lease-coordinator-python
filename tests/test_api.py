@@ -26,8 +26,11 @@ def test_acquire_returns_held_lease_with_fencing_token(client: TestClient) -> No
     assert lease["status"] == "HELD"
     assert lease["fencing_token"] == 1
     assert lease["expires_at_ms"] == lease["acquired_at_ms"] + 1000
-    # The secret credential must never be exposed through read endpoints.
-    assert "credential" not in lease
+    # The initial credential is delivered once, in the acquire response.
+    assert isinstance(lease["credential"], str) and lease["credential"]
+    # ... but never repeated by an ordinary query.
+    snap = client.get(f"/leases/{lease['lease_id']}").json()
+    assert "credential" not in snap
 
 
 def test_credential_is_required_for_renew_and_release(client: TestClient) -> None:
@@ -185,6 +188,32 @@ def test_http_server_generated_credential_rotation_is_usable(
         json={"credential": new_credential},
     )
     assert ok.status_code == 200
+
+
+def test_http_rotate_without_request_id_is_rejected_without_state_change(
+    client: TestClient,
+) -> None:
+    lease = client.post(
+        "/leases",
+        json={"resource_id": "r", "holder": "A", "ttl_ms": 10_000,
+              "credential": "old-secret"},
+    ).json()
+
+    r = client.post(
+        f"/leases/{lease['lease_id']}/rotate",
+        json={"credential": "old-secret", "new_credential": "new-secret"},
+    )
+    assert r.status_code == 400
+    assert r.json()["code"] == "missing_request_id"
+
+    # Nothing changed: old credential still works, no rotation recorded.
+    ok = client.post(
+        f"/leases/{lease['lease_id']}/renew",
+        json={"credential": "old-secret", "ttl_ms": 10_000},
+    )
+    assert ok.status_code == 200
+    events = client.get(f"/leases/{lease['lease_id']}/events").json()["items"]
+    assert [e["event_type"] for e in events] == ["ACQUIRED", "RENEWED"]
 
 
 def test_http_rotate_rejection_codes(client: TestClient, clock) -> None:

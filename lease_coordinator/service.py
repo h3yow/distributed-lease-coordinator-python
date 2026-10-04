@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 import secrets
 import threading
-import uuid
 from pathlib import Path
 
 from .errors import (
@@ -21,10 +20,12 @@ from .errors import (
     LeaseExpiredError,
     LeaseNotFoundError,
     LeaseReleasedError,
+    MissingRequestIdError,
     RotationConflictError,
 )
 from .ids import IdGenerator, UuidLeaseIdGenerator
 from .model import (
+    AcquireResult,
     Clock,
     CredentialRotation,
     EventPage,
@@ -138,8 +139,13 @@ class LeaseService:
         holder: str,
         ttl_ms: int,
         credential: str | None = None,
-    ) -> Lease:
-        """Acquire a lease; raises a typed LeaseError on rejection."""
+    ) -> AcquireResult:
+        """Acquire a lease; raises a typed LeaseError on rejection.
+
+        The initial credential is delivered only via the returned
+        :class:`AcquireResult`; subsequent queries expose merely its
+        at-rest fingerprint via the lease snapshot.
+        """
         if ttl_ms <= 0:
             raise ValueError("ttl_ms must be positive")
         now_ms = self._clock.now_ms()
@@ -150,8 +156,9 @@ class LeaseService:
             "acquire request resource=%s holder=%s lease_id=%s ttl_ms=%s now_ms=%s",
             resource_id, holder, lease_id, ttl_ms, now_ms,
         )
+        fingerprint = self._storage.codec.fingerprint(credential)
         fencing_token, conflict = self._storage.atomic_acquire(
-            resource_id, lease_id, holder, credential, now_ms, expires_at_ms
+            resource_id, lease_id, holder, fingerprint, now_ms, expires_at_ms
         )
         if conflict is not None:
             logger.warning(
@@ -170,7 +177,7 @@ class LeaseService:
             "acquire granted resource=%s lease_id=%s fencing_token=%s expires_at_ms=%s",
             resource_id, lease_id, fencing_token, expires_at_ms,
         )
-        return lease
+        return AcquireResult(lease=lease, credential=credential)
 
     def renew(self, lease_id: str, credential: str, ttl_ms: int) -> Lease:
         if ttl_ms <= 0:
@@ -182,7 +189,8 @@ class LeaseService:
             lease_id, ttl_ms, now_ms, len(credential),
         )
         lease, reason = self._storage.atomic_renew(
-            lease_id, credential, now_ms, expires_at_ms
+            lease_id, self._storage.codec.fingerprint(credential),
+            now_ms, expires_at_ms,
         )
         self._raise_for_reason(reason, lease, "renew")
         assert lease is not None
@@ -198,7 +206,9 @@ class LeaseService:
             "release request lease_id=%s now_ms=%s credential_len=%s",
             lease_id, now_ms, len(credential),
         )
-        lease, reason = self._storage.atomic_release(lease_id, credential, now_ms)
+        lease, reason = self._storage.atomic_release(
+            lease_id, self._storage.codec.fingerprint(credential), now_ms
+        )
         self._raise_for_reason(reason, lease, "release")
         assert lease is not None
         logger.info("release granted lease_id=%s", lease_id)
@@ -218,33 +228,58 @@ class LeaseService:
         same lease id, fencing token and expiry time; only the credential
         (and its version) changes.
 
-        ``request_id`` is the idempotency key. Retries and concurrent
-        duplicates carrying the same key and parameters converge to one
-        rotation: the first call is ``ROTATED``, later ones are ``REPLAYED``
-        and hand back the same credential. Reusing a key for a different
-        request raises :class:`RotationConflictError`. When omitted, the
-        server assigns a fresh key, so such a call cannot be retried
-        transparently.
+        ``request_id`` is the caller's idempotency key and is **mandatory**.
+        The server never assigns one on the caller's behalf: a key the
+        caller cannot repeat could not be retried, and a lost first
+        response would leave the old credential dead with the new one
+        unreachable. Omitting it raises :class:`MissingRequestIdError`
+        before any state is touched. Retries and concurrent duplicates
+        carrying the same key and parameters converge to one rotation: the
+        first call is ``ROTATED``, later ones are ``REPLAYED`` and hand
+        back the same credential, the same rotation time (the time of the
+        *first* swap) and the same frozen lease facts, even across process
+        restarts. Reusing a key for a different request raises
+        :class:`RotationConflictError`.
         """
         if not credential:
             raise ValueError("credential must be a non-empty string")
         if new_credential is not None and not new_credential:
             raise ValueError("new_credential must be a non-empty string when given")
-        request_id = request_id or f"srv-{uuid.uuid4().hex}"
+        if not request_id:
+            logger.warning(
+                "rotate rejected lease_id=%s: missing caller-supplied "
+                "request_id (no state changed)",
+                lease_id,
+            )
+            raise MissingRequestIdError(
+                "rotate requires a caller-supplied request_id so the request "
+                "can be retried safely after a lost response"
+            )
+        final_new = new_credential or secrets.token_hex(16)
+        if final_new == credential:
+            raise ValueError(
+                "new credential must differ from the current credential"
+            )
         now_ms = self._clock.now_ms()
+        codec = self._storage.codec
+        presented_fingerprint = codec.fingerprint(credential)
+        new_fingerprint = codec.fingerprint(final_new)
+        sealed = codec.seal(final_new)
+        source = "caller" if new_credential is not None else "server"
         logger.info(
             "rotate request lease_id=%s request_id=%s now_ms=%s "
             "credential_len=%s new_credential_source=%s",
-            lease_id, request_id, now_ms, len(credential),
-            "caller" if new_credential is not None else "server",
+            lease_id, request_id, now_ms, len(credential), source,
         )
         outcome, lease, reason = self._storage.atomic_rotate_credential(
-            lease_id, credential, new_credential, request_id, now_ms
+            lease_id, presented_fingerprint, new_fingerprint, sealed,
+            source, request_id, now_ms,
         )
         if reason is not None:
             self._raise_for_rotation_reason(reason, lease, lease_id, request_id)
         assert outcome is not None and lease is not None
         status = RotationStatus(str(outcome["status"]).upper())
+        rotated_at_ms = int(outcome["rotated_at_ms"])
         result = CredentialRotation(
             lease_id=lease_id,
             resource_id=lease.resource_id,
@@ -252,14 +287,14 @@ class LeaseService:
             status=status,
             credential=str(outcome["credential"]),
             credential_version=int(outcome["credential_version"]),
-            rotated_at_ms=now_ms,
+            rotated_at_ms=rotated_at_ms,
             lease=lease,
         )
         logger.info(
             "rotate %s lease_id=%s request_id=%s credential_version=%s "
-            "lease_expires_at_ms=%s lease_status=%s",
+            "rotated_at_ms=%s (request now_ms=%s) lease_status=%s",
             status.value.lower(), lease_id, result.request_id,
-            result.credential_version, lease.expires_at_ms,
+            result.credential_version, rotated_at_ms, now_ms,
             lease.status.value,
         )
         return result
@@ -286,10 +321,6 @@ class LeaseService:
             raise RotationConflictError(
                 f"request id {request_id} was already used for a different "
                 f"rotation request"
-            )
-        if reason == "same_credential":
-            raise ValueError(
-                "new credential must differ from the current credential"
             )
         # Other reasons share the lease-scoped decision vocabulary.
         self._raise_for_reason(reason, lease, "rotate")

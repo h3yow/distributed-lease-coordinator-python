@@ -10,3 +10,5 @@ build/
 *.db
 *.db-wal
 *.db-shm
+*.key
+*.key.lock

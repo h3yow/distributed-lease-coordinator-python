@@ -43,6 +43,16 @@ class LeaseView(BaseModel):
     credential_version: int = 0
 
 
+class AcquireView(LeaseView):
+    """Response to a successful acquire.
+
+    Carries the initial holder credential exactly once, at acquisition;
+    ordinary lease views never include it.
+    """
+
+    credential: str
+
+
 class RotationView(BaseModel):
     """Result of a credential rotation.
 
